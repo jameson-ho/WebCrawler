@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+
+import argparse
+import socket
+import ssl
+import queue
+import sys
+from html.parser import HTMLParser
+from urllib.parse import urljoin
+import os
+import threading
+
+DEFAULT_SERVER = "fakebook.khoury.northeastern.edu"
+DEFAULT_PORT = 443
+
+class MyHTMLParser(HTMLParser):
+    def __init__(self, crawler):
+        super().__init__()
+        self.crawler = crawler
+
+    # processes <a> tags
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            for attr in attrs:
+                if attr[0] == 'href' and attr[1].startswith("/fakebook/"):
+                    link = urljoin(f'https://{self.crawler.server}', attr[1])
+                    #print(f"Found link: {link}")
+                    if link not in self.crawler.visited:
+                        self.crawler.queue.put(link)
+
+    # finds flags
+    def handle_data(self, data):
+        if 'FLAG: ' in data:
+            flag = data.split('FLAG: ', 1)[1].strip()
+            if flag not in self.crawler.flags:
+                flag_file = os.path.join(os.path.dirname(__file__), 'secret_flags')
+                with open(flag_file, 'a', encoding='utf-8') as f:
+                    f.write(flag + '\n')
+                self.crawler.flags.append(flag)
+                print(flag)
+                if len(self.crawler.flags) >= 5:
+                    self.crawler.found_all_flags.set()
+
+class Crawler:
+    def __init__(self, args):
+        self.server = args.server
+        self.port = args.port
+        self.username = args.username
+        self.password = args.password
+        self.csrf_token = None
+        self.session_id = None
+        self.queue = queue.Queue()
+        self.flags = []
+        self.visited = set()
+        self.found_all_flags = threading.Event()
+
+    def run(self):
+        self.login()
+        self.queue.put('/fakebook/')
+
+        threads = []
+        initial_thread = threading.Thread(target=self.run_crawl)
+        initial_thread.start()
+        threads.append(initial_thread)
+
+        # dynamically add threads as the queue fills up
+        while not self.found_all_flags.is_set():
+            if self.queue.qsize() > len(threads) and len(threads) < 100: 
+                thread = threading.Thread(target=self.run_crawl)
+                thread.start()
+                threads.append(thread)
+
+        for thread in threads:
+            thread.join()
+
+        # # create threads
+        # thread1 = threading.Thread(target=self.run_crawl)
+        # thread2 = threading.Thread(target=self.run_crawl)
+        # thread3 = threading.Thread(target=self.run_crawl)
+        # thread4 = threading.Thread(target=self.run_crawl)
+        # thread5 = threading.Thread(target=self.run_crawl)
+
+        # # start threads
+        # thread1.start()
+        # thread2.start()
+        # thread3.start()
+        # thread4.start()
+        # thread5.start()
+
+        # # join threads
+        # thread1.join()
+        # thread2.join()
+        # thread3.join()
+        # thread4.join()
+        # thread5.join()
+
+    # starts a crawl based on queue
+    def run_crawl(self):
+        while not self.found_all_flags.is_set():
+            try:
+                path = self.queue.get(timeout=1)
+                self.crawl(path)
+                self.queue.task_done()
+            except queue.Empty:
+                return
+    
+    # search through link
+    def crawl(self, path):
+        if path in self.visited:
+            return
+        self.visited.add(path)
+
+        # create socket
+        with socket.create_connection((self.server, self.port)) as sock:
+            with ssl.create_default_context().wrap_socket(sock, server_hostname=self.server) as tls:
+                # get data from link
+                self.send_get(tls, path)
+                data = self.read_response(tls)
+                self.handle_response(tls, data, path)
+
+    # does something based on response code
+    def handle_response(self, sock, data, path):
+        lines = data.splitlines()
+        if not lines:
+            return
+        
+        parts = lines[0].split(' ')
+        if len(parts) < 2:
+            return 
+        
+        response = parts[1]
+
+        match response:
+            case '200':
+                self.search(data)
+            case '302':
+                # retry with new location
+                location = None
+                for line in data.splitlines():
+                    if line.lower().startswith("location:"):
+                        location = line.split(": ", 1)[1].strip()
+                        break
+                if location and location not in self.visited:
+                    self.queue.put(location)
+            case _ if response.startswith('4'):
+                # abandon URL and get next in queue
+                if self.queue.qsize() > 0:
+                    self.crawl(self.queue.get())
+            case _ if response.startswith('5'):
+                # retry with same URL
+                self.send_get(sock, path)
+                data = self.read_response(sock)
+                self.handle_response(sock, data, path)
+
+    # uses content-length to determine end of data
+    def read_response(self, sock):
+        response = b""
+        headers_done = False
+        content_length = None
+
+        while True:
+            # read data in chunks
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+
+            if not headers_done:
+                headers, _, body = response.partition(b"\r\n\r\n")
+                headers_done = True
+
+                for line in headers.decode(errors="ignore").split("\r\n"):
+                    if line.lower().startswith("content-length:"):
+                        content_length = int(line.split(":")[1].strip())
+                        break
+
+            if content_length is not None:
+                # stop if content-length is reached
+                if len(body) >= content_length:
+                    break
+
+        return response.decode("utf-8", errors="ignore")
+
+    # search for flags
+    def search(self, data):
+        searcher = MyHTMLParser(self)
+        searcher.feed(data)
+        #print(f"Queue Size: {self.queue.qsize()}, Visited: {len(self.visited)}")
+
+    # send get request
+    def send_get(self, sock, path):
+        headers = [
+            f'GET {path} HTTP/1.1',
+            f'Host: {self.server}:{self.port}',
+            'Connection: keep-alive'
+        ]
+        
+        if self.csrf_token and self.session_id:
+            headers.append(f'Cookie: csrftoken={self.csrf_token}; sessionid={self.session_id};')
+        
+        request = '\r\n'.join(headers) + '\r\n\r\n'
+        sock.sendall(request.encode('ascii'))
+
+    # send post request
+    def send_post(self, sock, path, post_data):
+        headers = [
+            f'POST {path} HTTP/1.1',
+            f'Host: {self.server}:{self.port}',
+            f'Content-Length: {len(post_data)}',
+            'Content-Type: application/x-www-form-urlencoded',
+            f'Cookie: csrftoken={self.csrf_token}; sessionid={self.session_id};'
+        ]
+        
+        request = "\r\n".join(headers) + "\r\n\r\n" + post_data + "\r\n"
+        sock.sendall(request.encode('ascii'))
+
+    # get cookies
+    def get_cookies(self, data):
+        for lines in data.splitlines():
+            if lines.lower().startswith('set-cookie:'):
+                # extract key-value pair
+                cookie = lines.split(';')[0].split(': ')[1]
+                key, value = cookie.split('=', 1)
+                # assign values
+                if key == 'csrftoken':
+                    self.csrf_token = value
+                elif key == 'sessionid':
+                    self.session_id = value
+
+    # get csrf token
+    def extract_csrf(self, data):
+        lines = data.split('\n')
+        for line in lines:
+            if 'csrfmiddlewaretoken' in line:
+                return line.split('value="', 1)[1].split('"', 1)[0]
+
+    # login to fakebook
+    def login(self):
+        # create socket
+        with socket.create_connection((self.server, self.port)) as mysocket:
+            with ssl.create_default_context().wrap_socket(mysocket, server_hostname=self.server) as tls:
+                self.send_get(tls, '/accounts/login/?next=/fakebook/')
+                data = tls.recv(4096).decode('ascii')
+
+                csrf_token = self.extract_csrf(data)
+                while not csrf_token:
+                    data += tls.recv(4096).decode('ascii')
+                    csrf_token = self.extract_csrf(data)
+
+                if not self.session_id:
+                    self.get_cookies(data)
+
+                # send post request
+                post_data = f'username={self.username}&password={self.password}&csrfmiddlewaretoken={csrf_token}&next=/fakebook/'
+                self.send_post(tls, '/accounts/login/?next=/fakebook/', post_data)
+                data = tls.recv(4096).decode('ascii')
+
+                response = data.splitlines()[0].split(' ')[1]
+
+                if response == '302':
+                    self.get_cookies(data)
+                    return True
+                else:
+                    return False
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='crawl Fakebook')
+    parser.add_argument('-s', dest="server", type=str, default=DEFAULT_SERVER, help="The server to crawl")
+    parser.add_argument('-p', dest="port", type=int, default=DEFAULT_PORT, help="The port to use")
+    parser.add_argument('username', type=str, help="The username to use")
+    parser.add_argument('password', type=str, help="The password to use")
+    args = parser.parse_args()
+    sender = Crawler(args)
+    sender.run()
