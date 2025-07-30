@@ -1,4 +1,4 @@
-# Jameson Ho - Project 5
+# Jameson Ho - Web Crawler
 
 ## High-Level Approach
 
